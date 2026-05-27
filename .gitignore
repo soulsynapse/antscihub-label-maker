@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Local app/session artifacts
+.avery_5267_gui.ini
+label_session.json
+
+# Generated label outputs
+avery_5267_labels.png
+avery_5267_labels.pdf
