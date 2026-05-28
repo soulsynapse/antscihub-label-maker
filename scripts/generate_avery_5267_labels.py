@@ -30,6 +30,21 @@ V_PITCH_IN = 0.5
 MAX_LABELS = COLS * ROWS
 DEFAULT_DPI = 1200
 DEFAULT_ARUCO_DICT = "DICT_6X6_250"
+FONT_POINT_SIZE = 4.0
+MAX_TEXT_LINES = 5
+MARKER_TYPE_NONE = "none"
+MARKER_TYPE_ARUCO = "aruco"
+MARKER_TYPE_DATAMATRIX = "datamatrix"
+MARKER_TYPES = (MARKER_TYPE_NONE, MARKER_TYPE_ARUCO, MARKER_TYPE_DATAMATRIX)
+MM_PER_IN = 25.4
+ARUCO_MARKER_SIZE_MM = 8.0
+ARUCO_LEFT_OFFSET_MM = 2.0
+ARUCO_RIGHT_GAP_MM = 2.0
+TEXT_VERTICAL_PADDING_MM = 2.0
+ARUCO_MARKER_SIZE_IN = ARUCO_MARKER_SIZE_MM / MM_PER_IN
+ARUCO_LEFT_OFFSET_IN = ARUCO_LEFT_OFFSET_MM / MM_PER_IN
+ARUCO_RIGHT_GAP_IN = ARUCO_RIGHT_GAP_MM / MM_PER_IN
+TEXT_VERTICAL_PADDING_IN = TEXT_VERTICAL_PADDING_MM / MM_PER_IN
 
 
 def _require_pillow():
@@ -50,14 +65,24 @@ def _maybe_import_cv2():
     return cv2
 
 
+def _maybe_import_datamatrix_encode():
+    try:
+        from pylibdmtx.pylibdmtx import encode as dmtx_encode  # pylint: disable=import-error
+    except Exception:  # pylint: disable=broad-except
+        return None
+    return dmtx_encode
+
+
 def _to_px(inches, dpi):
     return int(round(inches * dpi))
 
 
 def _load_font(ImageFont, size_px):
-    # Try common TrueType fonts first for scalable text.
+    # Prefer regular Arial, then fall back to common sans-serif fonts.
     font_candidates = [
         "arial.ttf",
+        "Arial.ttf",
+        "ARIAL.TTF",
         "segoeui.ttf",
         "DejaVuSans.ttf",
         "LiberationSans-Regular.ttf",
@@ -98,25 +123,45 @@ def _fit_font(ImageFont, lines, box_w, box_h):
     return _load_font(ImageFont, min_size)
 
 
+def _normalize_marker_type(value):
+    marker_type = str(value).strip().lower() if value is not None else ""
+    if marker_type in MARKER_TYPES:
+        return marker_type
+    return MARKER_TYPE_NONE
+
+
 def _normalize_label_spec(label_spec):
     if label_spec is None:
         return {
             "lines": [],
-            "has_aruco": False,
-            "aruco_id": 0,
-            "aruco_dict": DEFAULT_ARUCO_DICT,
+            "marker_type": MARKER_TYPE_NONE,
+            "marker_id": 0,
+            "marker_dict": DEFAULT_ARUCO_DICT,
         }
 
     lines = label_spec.get("lines", [])
     if isinstance(lines, str):
         lines = [lines]
-    lines = [str(line) for line in lines if str(line).strip()]
+    lines = [str(line) if line is not None else "" for line in lines[:MAX_TEXT_LINES]]
+    while len(lines) < MAX_TEXT_LINES:
+        lines.append("")
+
+    # Backward compatibility with older specs that used has_aruco/aruco_id/aruco_dict.
+    has_aruco_legacy = bool(label_spec.get("has_aruco", False))
+    marker_type = _normalize_marker_type(label_spec.get("marker_type", None))
+    if marker_type == MARKER_TYPE_NONE and has_aruco_legacy:
+        marker_type = MARKER_TYPE_ARUCO
+
+    marker_id = int(label_spec.get("marker_id", label_spec.get("aruco_id", 0)))
+    marker_dict = str(
+        label_spec.get("marker_dict", label_spec.get("aruco_dict", DEFAULT_ARUCO_DICT))
+    )
 
     return {
         "lines": lines,
-        "has_aruco": bool(label_spec.get("has_aruco", False)),
-        "aruco_id": int(label_spec.get("aruco_id", 0)),
-        "aruco_dict": str(label_spec.get("aruco_dict", DEFAULT_ARUCO_DICT)),
+        "marker_type": marker_type,
+        "marker_id": marker_id,
+        "marker_dict": marker_dict,
     }
 
 
@@ -141,6 +186,17 @@ def _get_aruco_marker(side_px, marker_id, dict_name):
 
     dictionary_id = getattr(cv2.aruco, dict_name)
     dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
+
+    # Keep marker IDs valid for the selected dictionary.
+    dictionary_size = 0
+    if hasattr(dictionary, "bytesList"):
+        try:
+            dictionary_size = int(dictionary.bytesList.shape[0])
+        except Exception:  # pylint: disable=broad-except
+            dictionary_size = 0
+    if dictionary_size > 0:
+        marker_id = int(marker_id) % dictionary_size
+
     if hasattr(cv2.aruco, "generateImageMarker"):
         marker = cv2.aruco.generateImageMarker(dictionary, marker_id, side_px)
     elif hasattr(cv2.aruco, "drawMarker"):
@@ -150,44 +206,67 @@ def _get_aruco_marker(side_px, marker_id, dict_name):
     return marker
 
 
+def _get_datamatrix_marker(Image, side_px, marker_value):
+    dmtx_encode = _maybe_import_datamatrix_encode()
+    if dmtx_encode is None:
+        raise RuntimeError(
+            "pylibdmtx is required for DataMatrix markers. "
+            "Install with: pip install pylibdmtx"
+        )
+
+    payload = str(marker_value).encode("utf-8")
+    encoded = dmtx_encode(payload)
+    marker = Image.frombytes("RGB", (encoded.width, encoded.height), encoded.pixels)
+    marker = marker.convert("L")
+    marker = marker.resize((int(side_px), int(side_px)), resample=Image.Resampling.NEAREST)
+    return marker
+
+
 def _draw_label(
     draw, Image, ImageFont, page, x0, y0, label_w, label_h, label_spec, dpi
 ):
-    inner_pad = max(8, int(round(0.02 * dpi)))  # ~0.02"
-    gap = max(8, int(round(0.02 * dpi)))
+    horizontal_pad = max(8, int(round(0.02 * dpi)))  # ~0.02"
+    marker_text_gap = _to_px(ARUCO_RIGHT_GAP_IN, dpi)
+    text_vertical_pad = _to_px(TEXT_VERTICAL_PADDING_IN, dpi)
 
     lines = label_spec["lines"]
-    has_aruco = label_spec["has_aruco"]
-    aruco_id = label_spec["aruco_id"]
-    aruco_dict = label_spec["aruco_dict"]
+    marker_type = label_spec["marker_type"]
+    marker_id = label_spec["marker_id"]
+    marker_dict = label_spec["marker_dict"]
 
-    text_x0 = x0 + inner_pad
-    text_y0 = y0 + inner_pad
-    text_y1 = y0 + label_h - inner_pad
-    text_x1 = x0 + label_w - inner_pad
+    text_x0 = x0 + horizontal_pad
+    text_y0 = y0 + text_vertical_pad
+    text_y1 = y0 + label_h - text_vertical_pad
+    text_x1 = x0 + label_w - horizontal_pad
 
-    if has_aruco:
-        marker_side = label_h - (2 * inner_pad)
-        marker_side = max(20, marker_side)
-        marker_img = _get_aruco_marker(marker_side, aruco_id, aruco_dict)
-        marker_pil = Image.fromarray(marker_img).convert("L")
-        marker_x = x0 + inner_pad
-        marker_y = y0 + inner_pad
-        page.paste(marker_pil, (marker_x, marker_y))
-        text_x0 = marker_x + marker_side + gap
+    if marker_type != MARKER_TYPE_NONE:
+        marker_side = _to_px(ARUCO_MARKER_SIZE_IN, dpi)
+        marker_side = max(1, min(marker_side, label_h))
+        if marker_type == MARKER_TYPE_ARUCO:
+            marker_img = _get_aruco_marker(marker_side, marker_id, marker_dict)
+            marker_pil = Image.fromarray(marker_img).convert("L")
+        elif marker_type == MARKER_TYPE_DATAMATRIX:
+            marker_pil = _get_datamatrix_marker(Image, marker_side, marker_id)
+        else:
+            marker_pil = None
+        marker_x = x0 + _to_px(ARUCO_LEFT_OFFSET_IN, dpi)
+        marker_y = y0 + int(round((label_h - marker_side) / 2.0))
+        if marker_pil is not None:
+            page.paste(marker_pil, (marker_x, marker_y))
+            text_x0 = marker_x + marker_side + marker_text_gap
 
-    text_box_w = max(10, text_x1 - text_x0)
     text_box_h = max(10, text_y1 - text_y0)
-    font = _fit_font(ImageFont, lines, text_box_w, text_box_h)
+    font_px = max(1, int(round((FONT_POINT_SIZE / 72.0) * dpi)))
+    font = _load_font(ImageFont, font_px)
 
-    line_sizes = [_get_text_size(font, line) for line in lines]
-    total_height = sum(h for _, h in line_sizes)
-    current_y = text_y0 + max(0, (text_box_h - total_height) // 2)
-
-    for line, (line_w, line_h) in zip(lines, line_sizes):
-        line_x = text_x0 + max(0, (text_box_w - line_w) // 2)
-        draw.text((line_x, current_y), line, fill=0, font=font)
-        current_y += line_h
+    line_h = float(text_box_h) / float(MAX_TEXT_LINES)
+    for i, line in enumerate(lines[:MAX_TEXT_LINES]):
+        if not line.strip():
+            continue
+        _, line_px_h = _get_text_size(font, line)
+        current_y = text_y0 + (i * line_h) + max(0.0, (line_h - line_px_h) / 2.0)
+        # Always render text left-justified to match the GUI preview.
+        draw.text((text_x0, int(round(current_y))), line, fill=0, font=font)
 
 
 def generate_avery_5267_sheet(
@@ -204,9 +283,9 @@ def generate_avery_5267_sheet(
         label_spec_fn: callable(sequence_index, sheet_slot_index) -> dict
             Expected keys:
               - lines: list[str] or str
-              - has_aruco: bool
-              - aruco_id: int
-              - aruco_dict: str (e.g. DICT_6X6_250)
+              - marker_type: "none" | "aruco" | "datamatrix"
+              - marker_id: int
+              - marker_dict: str (ArUco dictionary, e.g. DICT_6X6_250)
         output_stem: path without extension (or with extension; extension is removed)
         missing: number of labels already used on the sheet (0..79), filled row-major
         count: number of labels to print from remaining slots (default: all remaining)
@@ -287,20 +366,32 @@ def _parse_args(argv):
         help="Render DPI (default: 1200).",
     )
     parser.add_argument(
+        "--marker-type",
+        default=MARKER_TYPE_NONE,
+        choices=MARKER_TYPES,
+        help="Marker type: none, aruco, or datamatrix (default: none).",
+    )
+    parser.add_argument(
+        "--id",
+        type=int,
+        default=0,
+        help="Marker ID/value (default: 0).",
+    )
+    parser.add_argument(
         "--has-aruco",
         action="store_true",
-        help="Include an ArUco marker in each generated label.",
+        help="Legacy alias for --marker-type aruco.",
     )
     parser.add_argument(
         "--aruco-id",
         type=int,
         default=0,
-        help="ArUco marker ID (default: 0).",
+        help="Legacy alias for --id.",
     )
     parser.add_argument(
         "--aruco-dict",
         default=DEFAULT_ARUCO_DICT,
-        help="ArUco dictionary name (default: DICT_6X6_250).",
+        help="ArUco dictionary name (default: DICT_6X6_250). Used for aruco markers.",
     )
     parser.add_argument(
         "--line",
@@ -311,7 +402,7 @@ def _parse_args(argv):
     return parser.parse_args(argv)
 
 
-def _make_static_label_fn(lines, has_aruco, aruco_id, aruco_dict):
+def _make_static_label_fn(lines, marker_type, marker_id, marker_dict):
     clean_lines = [line for line in lines if line.strip()]
     if not clean_lines:
         clean_lines = ["Label"]
@@ -319,9 +410,9 @@ def _make_static_label_fn(lines, has_aruco, aruco_id, aruco_dict):
     def _label_fn(seq_index, slot_index):  # pylint: disable=unused-argument
         return {
             "lines": clean_lines,
-            "has_aruco": has_aruco,
-            "aruco_id": aruco_id,
-            "aruco_dict": aruco_dict,
+            "marker_type": marker_type,
+            "marker_id": marker_id,
+            "marker_dict": marker_dict,
         }
 
     return _label_fn
@@ -329,8 +420,14 @@ def _make_static_label_fn(lines, has_aruco, aruco_id, aruco_dict):
 
 def main(argv=None):
     args = _parse_args(argv if argv is not None else sys.argv[1:])
+    marker_type = _normalize_marker_type(args.marker_type)
+    marker_id = int(args.id)
+    if args.has_aruco:
+        marker_type = MARKER_TYPE_ARUCO
+        marker_id = int(args.aruco_id)
+
     label_fn = _make_static_label_fn(
-        args.line, args.has_aruco, args.aruco_id, args.aruco_dict
+        args.line, marker_type, marker_id, args.aruco_dict
     )
     try:
         outputs = generate_avery_5267_sheet(
