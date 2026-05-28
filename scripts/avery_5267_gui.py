@@ -3,12 +3,13 @@
 PyQt6 GUI for building Avery 5267 label sheets.
 
 Layout:
-- Left: live sheet preview
-- Right: settings + per-label text table
+- Tab 1: Import CSV/Excel data with a left-side table preview
+- Tab 2: Label builder with live sheet preview and settings
 """
 
 from __future__ import absolute_import, division, print_function
 
+import csv
 import json
 import os
 import re
@@ -30,6 +31,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -45,6 +47,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -60,6 +63,16 @@ try:
     from pylibdmtx.pylibdmtx import encode as dmtx_encode
 except Exception:  # pylint: disable=broad-except
     dmtx_encode = None
+
+try:
+    import qrcode
+except Exception:  # pylint: disable=broad-except
+    qrcode = None
+
+try:
+    from openpyxl import load_workbook
+except Exception:  # pylint: disable=broad-except
+    load_workbook = None
 
 # Ensure importing sibling script works when launching from repo root.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -81,11 +94,16 @@ from generate_avery_5267_labels import (  # noqa: E402
     MARKER_TYPE_ARUCO,
     MARKER_TYPE_DATAMATRIX,
     MARKER_TYPE_NONE,
+    MARKER_TYPE_QR,
     MAX_TEXT_LINES,
     MAX_LABELS,
     PAGE_HEIGHT_IN,
     PAGE_WIDTH_IN,
     ROWS,
+    SIDE_LINE_HEIGHT_IN,
+    SIDE_LINE_RIGHT_OFFSET_IN,
+    SIDE_LINE_TEXT_GAP_IN,
+    SIDE_LINE_WIDTH_IN,
     TEXT_VERTICAL_PADDING_IN,
     TOP_MARGIN_IN,
     V_PITCH_IN,
@@ -122,17 +140,16 @@ MONTH_ABBR_UPPER = {
     11: "NOV",
     12: "DEC",
 }
-TOKEN_PATTERN = re.compile(r"\{(date|name)\}", flags=re.IGNORECASE)
+TOKEN_PATTERN = re.compile(r"\{(date|name|dict|id)\}", flags=re.IGNORECASE)
 MARKER_TYPE_ITEMS = (
     ("ArUco", MARKER_TYPE_ARUCO),
     ("DataMatrix", MARKER_TYPE_DATAMATRIX),
+    ("QR", MARKER_TYPE_QR),
 )
-MARKER_TYPE_LABEL_BY_VALUE = {value: label for label, value in MARKER_TYPE_ITEMS}
 MARKER_TYPE_VALUE_BY_LABEL = {
     label.strip().lower(): value for label, value in MARKER_TYPE_ITEMS
 }
 MARKER_TYPE_VALUE_BY_LABEL["none"] = MARKER_TYPE_NONE
-MARKER_TYPE_LABEL_NONE = "None"
 
 
 def _safe_int(text, fallback):
@@ -163,16 +180,9 @@ def _normalize_marker_type(value):
     if value is None:
         return MARKER_TYPE_NONE
     key = str(value).strip().lower()
-    if key in (MARKER_TYPE_ARUCO, MARKER_TYPE_DATAMATRIX, MARKER_TYPE_NONE):
+    if key in (MARKER_TYPE_ARUCO, MARKER_TYPE_DATAMATRIX, MARKER_TYPE_QR, MARKER_TYPE_NONE):
         return key
     return MARKER_TYPE_VALUE_BY_LABEL.get(key, MARKER_TYPE_NONE)
-
-
-def _marker_label(marker_type):
-    normalized = _normalize_marker_type(marker_type)
-    if normalized == MARKER_TYPE_NONE:
-        return MARKER_TYPE_LABEL_NONE
-    return MARKER_TYPE_LABEL_BY_VALUE.get(normalized, "ArUco")
 
 
 def _format_today_line5():
@@ -393,6 +403,58 @@ class SheetPreviewWidget(QWidget):
             self._aruco_cache.pop(next(iter(self._aruco_cache)))
         return qimg
 
+    def _get_qr_qimage(self, side_px, marker_id):
+        if side_px < 8:
+            return None
+
+        marker_id = _safe_int(marker_id, 0)
+        key = ("qr", int(marker_id), int(side_px))
+        cached = self._aruco_cache.get(key)
+        if cached is not None:
+            return cached
+
+        if qrcode is None:
+            return None
+
+        try:
+            qr = qrcode.QRCode(
+                version=None,
+                error_correction=qrcode.constants.ERROR_CORRECT_M,
+                box_size=1,
+                border=0,
+            )
+            qr.add_data(str(marker_id))
+            qr.make(fit=True)
+            matrix = qr.get_matrix()
+            if not matrix:
+                return None
+
+            module_count = len(matrix)
+            qimg = QImage(int(side_px), int(side_px), QImage.Format.Format_Grayscale8)
+            qimg.fill(255)
+            qp = QPainter(qimg)
+            qp.setPen(Qt.PenStyle.NoPen)
+            qp.setBrush(QColor(0, 0, 0))
+            for y, row_data in enumerate(matrix):
+                y0 = int(round((y * side_px) / float(module_count)))
+                y1 = int(round(((y + 1) * side_px) / float(module_count)))
+                h = max(1, y1 - y0)
+                for x, cell_on in enumerate(row_data):
+                    if not cell_on:
+                        continue
+                    x0 = int(round((x * side_px) / float(module_count)))
+                    x1 = int(round(((x + 1) * side_px) / float(module_count)))
+                    w = max(1, x1 - x0)
+                    qp.fillRect(x0, y0, w, h, QColor(0, 0, 0))
+            qp.end()
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+        self._aruco_cache[key] = qimg
+        if len(self._aruco_cache) > 512:
+            self._aruco_cache.pop(next(iter(self._aruco_cache)))
+        return qimg
+
     def paintEvent(self, event):  # pylint: disable=unused-argument
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -440,6 +502,46 @@ class SheetPreviewWidget(QWidget):
             text_y1 = (r.y() + r.height()) - text_vertical_pad
             marker_type = _normalize_marker_type(spec.get("marker_type", MARKER_TYPE_NONE))
             marker_id = _safe_int(spec.get("marker_id", 0), 0)
+            side_line_text = str(spec.get("side_line", "")).strip()
+
+            if side_line_text:
+                side_w = min(r.width(), SIDE_LINE_WIDTH_IN * px_per_in)
+                side_h = min(r.height(), SIDE_LINE_HEIGHT_IN * px_per_in)
+                side_right_offset = SIDE_LINE_RIGHT_OFFSET_IN * px_per_in
+                side_x = r.x() + r.width() - side_right_offset - side_w
+                side_x = max(r.x(), min(r.x() + r.width() - side_w, side_x))
+                side_y = r.y() + (r.height() - side_h) / 2.0
+                side_rect = QRectF(side_x, side_y, side_w, side_h)
+
+                painter.fillRect(side_rect, QColor(0, 0, 0))
+                side_gap = SIDE_LINE_TEXT_GAP_IN * px_per_in
+                text_right = min(text_right, side_rect.x() - side_gap)
+                text_w = max(4.0, text_right - text_x)
+
+                painter.save()
+                side_font = QFont("Arial")
+                side_font.setBold(True)
+                side_font_px = max(
+                    1, int(round(min(side_rect.width() * 0.85, side_rect.height() * 0.35)))
+                )
+                side_font.setPixelSize(side_font_px)
+                painter.setFont(side_font)
+                painter.setPen(QPen(QColor(255, 255, 255), 1))
+                center = side_rect.center()
+                painter.translate(center.x(), center.y())
+                painter.rotate(-90.0)
+                rotated_rect = QRectF(
+                    -side_rect.height() / 2.0,
+                    -side_rect.width() / 2.0,
+                    side_rect.height(),
+                    side_rect.width(),
+                )
+                painter.drawText(
+                    rotated_rect,
+                    int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter),
+                    side_line_text,
+                )
+                painter.restore()
 
             if marker_type != MARKER_TYPE_NONE:
                 marker_size = ARUCO_MARKER_SIZE_IN * px_per_in
@@ -450,6 +552,8 @@ class SheetPreviewWidget(QWidget):
                 marker_side_px = max(16, int(round(marker_size)))
                 if marker_type == MARKER_TYPE_DATAMATRIX:
                     marker_img = self._get_datamatrix_qimage(marker_side_px, marker_id)
+                elif marker_type == MARKER_TYPE_QR:
+                    marker_img = self._get_qr_qimage(marker_side_px, marker_id)
                 else:
                     marker_img = self._get_aruco_qimage(
                         marker_side_px,
@@ -520,6 +624,7 @@ class Avery5267Window(QMainWindow):
     COL_LINE3 = 5
     COL_LINE4 = 6
     COL_LINE5 = 7
+    COL_SIDE_LINE = 8
     # Backward-compatible aliases used in older code paths/saved sessions.
     COL_USE_ARUCO = COL_USE_MARKER
     COL_ARUCO_ID = COL_MARKER_ID
@@ -530,6 +635,11 @@ class Avery5267Window(QMainWindow):
         super(Avery5267Window, self).__init__()
         self._table_syncing = False
         self._copied_row_payload = None
+        self.import_source_path = ""
+        self.import_source_kind = ""
+        self.import_headers = []
+        self.import_rows = []
+        self._loading_import_sheet = False
         repo_root = os.path.dirname(SCRIPT_DIR)
         self.settings_path = os.path.join(repo_root, self.SETTINGS_FILENAME)
         self.settings = QSettings(self.settings_path, QSettings.Format.IniFormat)
@@ -541,9 +651,129 @@ class Avery5267Window(QMainWindow):
         self.setCentralWidget(root)
         root_layout = QHBoxLayout(root)
         root_layout.setContentsMargins(10, 10, 10, 10)
+        self.tabs = QTabWidget()
+        root_layout.addWidget(self.tabs)
+
+        self.import_tab = QWidget()
+        self.editor_tab = QWidget()
+        self.tabs.addTab(self.import_tab, "Import")
+        self.tabs.addTab(self.editor_tab, "Label Builder")
+        self._build_import_tab()
+        self._build_editor_tab()
+
+        self._build_menu_bar()
+
+        # Signals
+        self.missing_spin.valueChanged.connect(self._on_missing_changed)
+        self.count_spin.valueChanged.connect(self._on_count_changed)
+        self.refresh_preview_btn.clicked.connect(self.refresh_preview)
+        self.apply_defaults_btn.clicked.connect(self.apply_defaults_to_rows)
+        self.save_btn.clicked.connect(self.save_files)
+        self.print_btn.clicked.connect(self.print_sheet)
+        self.table.itemChanged.connect(self._on_table_item_changed)
+        self.default_aruco_checkbox.toggled.connect(self._on_default_toggled)
+        self.marker_type_combo.currentIndexChanged.connect(self._on_defaults_changed)
+        self.aruco_start_spin.valueChanged.connect(self._on_defaults_changed)
+        self.name_token_checkbox.toggled.connect(self._on_name_token_changed)
+        self.researcher_name_edit.textChanged.connect(self._on_name_token_changed)
+        self.preview.wheel_adjust_requested.connect(self._on_preview_wheel_adjust)
+        self.import_open_btn.clicked.connect(self.import_file_dialog)
+        self.import_sheet_combo.currentIndexChanged.connect(self._on_import_sheet_changed)
+        self.import_apply_btn.clicked.connect(self.apply_import_to_labels)
+
+        self._load_session_state()
+        self._on_missing_changed(self.missing_spin.value())
+        self.refresh_preview()
+
+    def _build_import_tab(self):
+        layout = QHBoxLayout(self.import_tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        self.import_splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(self.import_splitter)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+        left_layout.addWidget(QLabel("Imported Data"))
+
+        self.import_table = QTableWidget()
+        self.import_table.setAlternatingRowColors(True)
+        self.import_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.import_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        self.import_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.import_table.verticalHeader().setVisible(False)
+        left_layout.addWidget(self.import_table, 1)
+        self.import_splitter.addWidget(left_panel)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(10)
+        self.import_splitter.addWidget(right_panel)
+
+        self.import_open_btn = QPushButton("Open CSV / Excel")
+        right_layout.addWidget(self.import_open_btn)
+
+        self.import_file_label = QLabel("No import file loaded.")
+        self.import_file_label.setWordWrap(True)
+        right_layout.addWidget(self.import_file_label)
+
+        sheet_form = QFormLayout()
+        self.import_sheet_combo = QComboBox()
+        self.import_sheet_combo.setEnabled(False)
+        sheet_form.addRow("Worksheet", self.import_sheet_combo)
+        right_layout.addLayout(sheet_form)
+
+        map_label = QLabel("Column Mapping")
+        right_layout.addWidget(map_label)
+
+        map_form = QFormLayout()
+        self.import_id_combo = QComboBox()
+        self.import_line1_combo = QComboBox()
+        self.import_line2_combo = QComboBox()
+        self.import_line3_combo = QComboBox()
+        self.import_line4_combo = QComboBox()
+        self.import_line5_combo = QComboBox()
+        self.import_side_combo = QComboBox()
+        map_form.addRow("ID", self.import_id_combo)
+        map_form.addRow("Line 1", self.import_line1_combo)
+        map_form.addRow("Line 2", self.import_line2_combo)
+        map_form.addRow("Line 3", self.import_line3_combo)
+        map_form.addRow("Line 4", self.import_line4_combo)
+        map_form.addRow("Line 5", self.import_line5_combo)
+        map_form.addRow("Side Line", self.import_side_combo)
+        right_layout.addLayout(map_form)
+
+        self.import_map_combos = {
+            "id": self.import_id_combo,
+            "line1": self.import_line1_combo,
+            "line2": self.import_line2_combo,
+            "line3": self.import_line3_combo,
+            "line4": self.import_line4_combo,
+            "line5": self.import_line5_combo,
+            "side_line": self.import_side_combo,
+        }
+        self._set_import_mapping_headers([])
+
+        self.import_apply_btn = QPushButton("Apply Import To Label Rows")
+        right_layout.addWidget(self.import_apply_btn)
+
+        self.import_status_label = QLabel("Load a CSV or Excel file to start.")
+        self.import_status_label.setWordWrap(True)
+        right_layout.addWidget(self.import_status_label)
+        right_layout.addStretch(1)
+
+        self.import_splitter.setStretchFactor(0, 4)
+        self.import_splitter.setStretchFactor(1, 2)
+
+    def _build_editor_tab(self):
+        layout = QHBoxLayout(self.editor_tab)
+        layout.setContentsMargins(8, 8, 8, 8)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        root_layout.addWidget(self.splitter)
+        layout.addWidget(self.splitter)
 
         # Left: preview
         self.preview = SheetPreviewWidget()
@@ -581,7 +811,7 @@ class Avery5267Window(QMainWindow):
         self.output_edit = QLineEdit("avery_5267_labels")
         form.addRow("Output Stem", self.output_edit)
 
-        self.token_hint_label = QLabel("Autofill tokens: {date}, {name}")
+        self.token_hint_label = QLabel("Autofill tokens: {date}, {name}, {dict}, {id}")
         form.addRow("", self.token_hint_label)
 
         name_row = QWidget()
@@ -636,9 +866,19 @@ class Avery5267Window(QMainWindow):
         right_layout.addWidget(table_label)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(8)
+        self.table.setColumnCount(9)
         self.table.setHorizontalHeaderLabels(
-            ["Slot", "Use Marker", "ID", "Line 1", "Line 2", "Line 3", "Line 4", "Line 5"]
+            [
+                "Slot",
+                "Use Marker",
+                "ID",
+                "Line 1",
+                "Line 2",
+                "Line 3",
+                "Line 4",
+                "Line 5",
+                "Side Line",
+            ]
         )
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(self.COL_SLOT, QHeaderView.ResizeMode.ResizeToContents)
@@ -650,6 +890,7 @@ class Avery5267Window(QMainWindow):
         )
         for col in self.LINE_COLS:
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_SIDE_LINE, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -659,29 +900,291 @@ class Avery5267Window(QMainWindow):
         self.status_label = QLabel("Ready.")
         right_layout.addWidget(self.status_label)
 
-        self._build_menu_bar()
+    def _set_import_mapping_headers(self, headers):
+        cleaned_headers = [str(h).strip() for h in headers if str(h).strip()]
+        for combo in self.import_map_combos.values():
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(None)", None)
+            for idx, header_name in enumerate(cleaned_headers):
+                combo.addItem(header_name, idx)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
 
-        # Signals
-        self.missing_spin.valueChanged.connect(self._on_missing_changed)
-        self.count_spin.valueChanged.connect(self._on_count_changed)
-        self.refresh_preview_btn.clicked.connect(self.refresh_preview)
-        self.apply_defaults_btn.clicked.connect(self.apply_defaults_to_rows)
-        self.save_btn.clicked.connect(self.save_files)
-        self.print_btn.clicked.connect(self.print_sheet)
-        self.table.itemChanged.connect(self._on_table_item_changed)
-        self.default_aruco_checkbox.toggled.connect(self._on_default_toggled)
-        self.marker_type_combo.currentIndexChanged.connect(self._on_defaults_changed)
-        self.aruco_start_spin.valueChanged.connect(self._on_defaults_changed)
-        self.name_token_checkbox.toggled.connect(self._on_name_token_changed)
-        self.researcher_name_edit.textChanged.connect(self._on_name_token_changed)
-        self.preview.wheel_adjust_requested.connect(self._on_preview_wheel_adjust)
+        self._auto_map_import_columns(cleaned_headers)
 
-        self._load_session_state()
-        self._on_missing_changed(self.missing_spin.value())
+    def _auto_map_import_columns(self, headers):
+        if not headers:
+            return
+
+        mapping_candidates = {
+            "id": ("id", "markerid", "arucoid", "datamatrixid", "qrid", "code"),
+            "line1": ("line1", "text1", "label1", "name"),
+            "line2": ("line2", "text2", "label2"),
+            "line3": ("line3", "text3", "label3"),
+            "line4": ("line4", "text4", "label4"),
+            "line5": ("line5", "text5", "label5", "date"),
+            "side_line": ("sideline", "side", "side_text", "edge"),
+        }
+
+        normalized = [re.sub(r"[^a-z0-9]+", "", h.lower()) for h in headers]
+        used = set()
+        for target_key, keys in mapping_candidates.items():
+            chosen = None
+            for idx, norm in enumerate(normalized):
+                if idx in used:
+                    continue
+                if norm in keys:
+                    chosen = idx
+                    break
+            if chosen is not None:
+                combo = self.import_map_combos.get(target_key)
+                if combo is not None:
+                    combo.setCurrentIndex(chosen + 1)
+                used.add(chosen)
+
+    def import_file_dialog(self):
+        default_path = str(self.settings.value("import_last_path", "")).strip()
+        if default_path and os.path.isdir(default_path):
+            start_path = default_path
+        elif default_path:
+            start_path = os.path.dirname(default_path)
+        else:
+            start_path = os.path.dirname(SCRIPT_DIR)
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import CSV or Excel",
+            start_path,
+            "Data Files (*.csv *.xlsx *.xlsm *.xltx *.xltm);;CSV Files (*.csv);;Excel Files (*.xlsx *.xlsm *.xltx *.xltm);;All Files (*)",
+        )
+        if not file_path:
+            self.import_status_label.setText("Import cancelled.")
+            return
+
+        try:
+            self._load_import_file(file_path)
+            self.settings.setValue("import_last_path", file_path)
+            self.settings.sync()
+        except Exception as exc:  # pylint: disable=broad-except
+            QMessageBox.critical(self, "Import Failed", str(exc))
+            self.import_status_label.setText("Import failed.")
+
+    def _load_import_file(self, file_path):
+        path = os.path.abspath(file_path)
+        ext = os.path.splitext(path)[1].lower()
+        self.import_source_path = path
+        self.import_file_label.setText(path)
+
+        if ext == ".csv":
+            headers, rows = self._read_csv_table(path)
+            self.import_source_kind = "csv"
+            self.import_sheet_combo.blockSignals(True)
+            self.import_sheet_combo.clear()
+            self.import_sheet_combo.addItem("(CSV)", "")
+            self.import_sheet_combo.setCurrentIndex(0)
+            self.import_sheet_combo.setEnabled(False)
+            self.import_sheet_combo.blockSignals(False)
+            self._set_import_data(headers, rows)
+            return
+
+        if ext not in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+            raise ValueError("Unsupported file type: {0}".format(ext or "(none)"))
+        if load_workbook is None:
+            raise RuntimeError("Excel import requires openpyxl. Install with: pip install openpyxl")
+
+        workbook = load_workbook(path, read_only=True, data_only=True)
+        try:
+            sheet_names = [str(name) for name in workbook.sheetnames]
+        finally:
+            workbook.close()
+
+        if not sheet_names:
+            raise ValueError("No worksheets found in Excel file.")
+
+        self.import_source_kind = "excel"
+        self.import_sheet_combo.blockSignals(True)
+        self.import_sheet_combo.clear()
+        for sheet_name in sheet_names:
+            self.import_sheet_combo.addItem(sheet_name, sheet_name)
+        self.import_sheet_combo.setEnabled(True)
+        self.import_sheet_combo.setCurrentIndex(0)
+        self.import_sheet_combo.blockSignals(False)
+        self._load_excel_sheet(sheet_names[0])
+
+    def _on_import_sheet_changed(self, _index):  # pylint: disable=unused-argument
+        if self._loading_import_sheet:
+            return
+        if self.import_source_kind != "excel":
+            return
+        sheet_name = self.import_sheet_combo.currentData()
+        if not sheet_name:
+            return
+        try:
+            self._load_excel_sheet(str(sheet_name))
+        except Exception as exc:  # pylint: disable=broad-except
+            QMessageBox.critical(self, "Import Failed", str(exc))
+            self.import_status_label.setText("Import failed.")
+
+    def _load_excel_sheet(self, sheet_name):
+        if not self.import_source_path:
+            raise ValueError("No Excel file selected.")
+        self._loading_import_sheet = True
+        try:
+            headers, rows = self._read_excel_table(self.import_source_path, sheet_name)
+            self._set_import_data(headers, rows)
+        finally:
+            self._loading_import_sheet = False
+
+    def _read_csv_table(self, file_path):
+        rows = None
+        decode_error = None
+        for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+            try:
+                with open(file_path, "r", encoding=encoding, newline="") as handle:
+                    reader = csv.reader(handle)
+                    rows = [list(row) for row in reader]
+                break
+            except UnicodeDecodeError as exc:
+                decode_error = exc
+        if rows is None:
+            raise RuntimeError("Unable to decode CSV file: {0}".format(decode_error))
+        return self._rows_to_table_data(rows)
+
+    def _read_excel_table(self, file_path, sheet_name):
+        workbook = load_workbook(file_path, read_only=True, data_only=True)
+        try:
+            if sheet_name not in workbook.sheetnames:
+                raise ValueError("Worksheet not found: {0}".format(sheet_name))
+            sheet = workbook[sheet_name]
+            rows = [list(row) for row in sheet.iter_rows(values_only=True)]
+        finally:
+            workbook.close()
+        return self._rows_to_table_data(rows)
+
+    def _rows_to_table_data(self, rows):
+        if not rows:
+            return [], []
+
+        max_cols = max(len(row) for row in rows)
+        normalized_rows = []
+        for row in rows:
+            padded = list(row) + [None] * (max_cols - len(row))
+            normalized_rows.append(padded)
+
+        while normalized_rows and all(
+            (cell is None) or (str(cell).strip() == "") for cell in normalized_rows[-1]
+        ):
+            normalized_rows.pop()
+
+        if not normalized_rows:
+            return [], []
+
+        raw_headers = normalized_rows[0]
+        data_rows = normalized_rows[1:]
+        headers = []
+        used = set()
+        for idx, value in enumerate(raw_headers):
+            base = str(value).strip() if value is not None else ""
+            if not base:
+                base = "Column {0}".format(idx + 1)
+            candidate = base
+            suffix = 2
+            while candidate.lower() in used:
+                candidate = "{0} ({1})".format(base, suffix)
+                suffix += 1
+            used.add(candidate.lower())
+            headers.append(candidate)
+
+        return headers, data_rows
+
+    def _set_import_data(self, headers, rows):
+        self.import_headers = list(headers)
+        self.import_rows = list(rows)
+
+        self.import_table.setRowCount(len(self.import_rows))
+        self.import_table.setColumnCount(len(self.import_headers))
+        self.import_table.setHorizontalHeaderLabels(self.import_headers)
+        for row_idx, row_values in enumerate(self.import_rows):
+            for col_idx in range(len(self.import_headers)):
+                value = row_values[col_idx] if col_idx < len(row_values) else ""
+                text = "" if value is None else str(value)
+                self.import_table.setItem(row_idx, col_idx, QTableWidgetItem(text))
+        self.import_table.resizeColumnsToContents()
+        self._set_import_mapping_headers(self.import_headers)
+        self.import_status_label.setText(
+            "Loaded {0} rows from import (excluding header).".format(len(self.import_rows))
+        )
+
+    def _get_import_mapped_value(self, row_values, combo):
+        col_idx = combo.currentData()
+        if col_idx is None:
+            return ""
+        try:
+            value = row_values[int(col_idx)]
+        except (TypeError, ValueError, IndexError):
+            return ""
+        return "" if value is None else str(value).strip()
+
+    def apply_import_to_labels(self):
+        if not self.import_rows or not self.import_headers:
+            self.import_status_label.setText("Load data before applying import.")
+            return
+
+        max_count = MAX_LABELS - self.missing_spin.value()
+        if max_count <= 0:
+            self.import_status_label.setText("No printable slots available from current missing count.")
+            return
+
+        import_count = min(len(self.import_rows), max_count)
+        self.count_spin.setValue(import_count)
+        self._sync_table_rows()
+
+        self._table_syncing = True
+        try:
+            for row in range(import_count):
+                data_row = self.import_rows[row]
+
+                id_text = self._get_import_mapped_value(data_row, self.import_id_combo)
+                if id_text:
+                    id_item = self.table.item(row, self.COL_ARUCO_ID)
+                    if id_item is not None:
+                        id_item.setText(id_text)
+
+                mapped_lines = [
+                    self._get_import_mapped_value(data_row, self.import_line1_combo),
+                    self._get_import_mapped_value(data_row, self.import_line2_combo),
+                    self._get_import_mapped_value(data_row, self.import_line3_combo),
+                    self._get_import_mapped_value(data_row, self.import_line4_combo),
+                    self._get_import_mapped_value(data_row, self.import_line5_combo),
+                ]
+                for idx, col in enumerate(self.LINE_COLS):
+                    item = self.table.item(row, col)
+                    if item is not None:
+                        item.setText(mapped_lines[idx])
+
+                side_value = self._get_import_mapped_value(data_row, self.import_side_combo)
+                side_item = self.table.item(row, self.COL_SIDE_LINE)
+                if side_item is not None:
+                    side_item.setText(side_value)
+        finally:
+            self._table_syncing = False
+
         self.refresh_preview()
+        self.tabs.setCurrentWidget(self.editor_tab)
+        applied = import_count
+        self.import_status_label.setText("Applied {0} imported row(s) to labels.".format(applied))
+        self.status_label.setText("Imported {0} row(s) into label table.".format(applied))
 
     def _build_menu_bar(self):
         file_menu = self.menuBar().addMenu("&File")
+
+        import_action = QAction("Import CSV/Excel...", self)
+        import_action.setShortcut("Ctrl+I")
+        import_action.triggered.connect(self.import_file_dialog)
+        file_menu.addAction(import_action)
+
+        file_menu.addSeparator()
 
         save_labels_action = QAction("Save Labels", self)
         save_labels_action.setShortcut("Ctrl+S")
@@ -782,6 +1285,7 @@ class Avery5267Window(QMainWindow):
             "use_marker": self._is_row_aruco_enabled(row),
             "id_text": self._get_item_text(row, self.COL_ARUCO_ID),
             "lines": [self._get_item_text(row, col) for col in self.LINE_COLS],
+            "side_line": self._get_item_text(row, self.COL_SIDE_LINE),
         }
 
     def _apply_row_payload(self, row, payload):
@@ -805,6 +1309,10 @@ class Avery5267Window(QMainWindow):
             item = self.table.item(row, col)
             if item is not None:
                 item.setText(str(lines[i]) if i < len(lines) else "")
+
+        side_line_item = self.table.item(row, self.COL_SIDE_LINE)
+        if side_line_item is not None:
+            side_line_item.setText(str(payload.get("side_line", "")))
 
     def copy_selected_row(self):
         self._sync_table_rows()
@@ -982,6 +1490,10 @@ class Avery5267Window(QMainWindow):
                         item = self.table.item(row, col)
                         if item is not None:
                             item.setText(lines[i] if i < len(lines) else "")
+
+                    side_line_item = self.table.item(row, self.COL_SIDE_LINE)
+                    if side_line_item is not None:
+                        side_line_item.setText(str(spec.get("side_line", "")))
             finally:
                 self._table_syncing = False
 
@@ -1239,6 +1751,10 @@ class Avery5267Window(QMainWindow):
                 for col in self.LINE_COLS:
                     if self.table.item(row, col) is None:
                         self.table.setItem(row, col, self._make_text_item("", editable=True))
+                if self.table.item(row, self.COL_SIDE_LINE) is None:
+                    self.table.setItem(
+                        row, self.COL_SIDE_LINE, self._make_text_item("", editable=True)
+                    )
 
             # If row count increased, ensure new rows inherit defaults.
             if count > existing:
@@ -1282,7 +1798,7 @@ class Avery5267Window(QMainWindow):
         self.refresh_preview()
         self.status_label.setText("Defaults copied into rows.")
 
-    def _resolve_line_tokens(self, text):
+    def _resolve_line_tokens(self, text, marker_id=None):
         raw_text = str(text) if text is not None else ""
         name_value = ""
         if self.name_token_checkbox.isChecked():
@@ -1291,6 +1807,8 @@ class Avery5267Window(QMainWindow):
         values = {
             "date": _format_today_line5(),
             "name": name_value,
+            "dict": self.aruco_dict_combo.currentText().strip(),
+            "id": str(_safe_int(marker_id, 0)),
         }
 
         def _replace(match):
@@ -1303,19 +1821,21 @@ class Avery5267Window(QMainWindow):
         specs = []
         selected_marker_type = _normalize_marker_type(self.marker_type_combo.currentData())
         for row in range(self.table.rowCount()):
-            lines = [self._get_item_text(row, col) for col in self.LINE_COLS]
-            if resolve_tokens:
-                lines = [self._resolve_line_tokens(line) for line in lines]
-
             aruco_default = self.aruco_start_spin.value() + row
             aruco_text = self._get_item_text(row, self.COL_ARUCO_ID)
             aruco_id = _safe_int(aruco_text, aruco_default)
+            side_line = self._get_item_text(row, self.COL_SIDE_LINE)
+            lines = [self._get_item_text(row, col) for col in self.LINE_COLS]
+            if resolve_tokens:
+                lines = [self._resolve_line_tokens(line, aruco_id) for line in lines]
+                side_line = self._resolve_line_tokens(side_line, aruco_id)
             has_marker = self._is_row_marker_enabled(row)
             marker_type = selected_marker_type if has_marker else MARKER_TYPE_NONE
 
             specs.append(
                 {
                     "lines": lines,
+                    "side_line": side_line,
                     "marker_type": marker_type,
                     "marker_id": aruco_id,
                     "marker_dict": self.aruco_dict_combo.currentText(),
@@ -1349,6 +1869,7 @@ class Avery5267Window(QMainWindow):
                 return row_specs[seq_index]
             return {
                 "lines": [],
+                "side_line": "",
                 "marker_type": MARKER_TYPE_NONE,
                 "marker_id": 0,
                 "marker_dict": self.aruco_dict_combo.currentText(),
