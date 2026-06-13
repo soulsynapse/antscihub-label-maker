@@ -120,24 +120,37 @@ def _load_font(ImageFont, size_px):
     return ImageFont.load_default()
 
 
-def _load_bold_font(ImageFont, size_px):
-    # Prefer bold Arial for side-line text.
-    font_candidates = [
-        "arialbd.ttf",
-        "ARIALBD.TTF",
-        "Arial Bold.ttf",
-        "arialnb.ttf",
-        "ARIALNB.TTF",
-        "Arial Narrow Bold.ttf",
-        "arialn.ttf",
-        "ARIALN.TTF",
-        "Arial Narrow.ttf",
-        "arial.ttf",
-        "Arial.ttf",
-        "ARIAL.TTF",
-        "DejaVuSans-Bold.ttf",
-        "LiberationSans-Bold.ttf",
-    ]
+def _load_styled_font(ImageFont, size_px, bold=False, italic=False):
+    if bold and italic:
+        font_candidates = [
+            "arialbi.ttf",
+            "ARIALBI.TTF",
+            "Arial Bold Italic.ttf",
+            "segoeuiz.ttf",
+            "DejaVuSans-BoldOblique.ttf",
+            "LiberationSans-BoldItalic.ttf",
+        ]
+    elif bold:
+        font_candidates = [
+            "arialbd.ttf",
+            "ARIALBD.TTF",
+            "Arial Bold.ttf",
+            "segoeuib.ttf",
+            "DejaVuSans-Bold.ttf",
+            "LiberationSans-Bold.ttf",
+        ]
+    elif italic:
+        font_candidates = [
+            "ariali.ttf",
+            "ARIALI.TTF",
+            "Arial Italic.ttf",
+            "segoeuii.ttf",
+            "DejaVuSans-Oblique.ttf",
+            "LiberationSans-Italic.ttf",
+        ]
+    else:
+        return _load_font(ImageFont, size_px)
+
     for font_name in font_candidates:
         try:
             return ImageFont.truetype(font_name, size_px)
@@ -188,6 +201,28 @@ def _normalize_marker_type(value):
     return MARKER_TYPE_NONE
 
 
+def _marker_value_text(value, fallback=""):
+    if value is None:
+        return str(fallback)
+    text = str(value).strip()
+    if text == "":
+        return str(fallback)
+    return text
+
+
+def _numeric_marker_id_or_zero(value):
+    text = _marker_value_text(value, "")
+    if text.isdigit():
+        return int(text)
+    return 0
+
+
+def _normalize_marker_value(value, marker_type):
+    if marker_type == MARKER_TYPE_ARUCO:
+        return _numeric_marker_id_or_zero(value)
+    return _marker_value_text(value, "")
+
+
 def _normalize_label_spec(label_spec):
     if label_spec is None:
         return {
@@ -211,7 +246,15 @@ def _normalize_label_spec(label_spec):
     if marker_type == MARKER_TYPE_NONE and has_aruco_legacy:
         marker_type = MARKER_TYPE_ARUCO
 
-    marker_id = int(label_spec.get("marker_id", label_spec.get("aruco_id", 0)))
+    marker_payload_value = label_spec.get(
+        "marker_payload",
+        label_spec.get(
+            "id_text",
+            label_spec.get("marker_id", label_spec.get("aruco_id", 0)),
+        ),
+    )
+    marker_payload = _marker_value_text(marker_payload_value, "0")
+    marker_id = _normalize_marker_value(label_spec.get("marker_id", marker_payload), marker_type)
     marker_dict = str(
         label_spec.get("marker_dict", label_spec.get("aruco_dict", DEFAULT_ARUCO_DICT))
     )
@@ -221,6 +264,7 @@ def _normalize_label_spec(label_spec):
         "lines": lines,
         "marker_type": marker_type,
         "marker_id": marker_id,
+        "marker_payload": marker_payload,
         "marker_dict": marker_dict,
         "side_line": side_line,
     }
@@ -245,6 +289,7 @@ def _get_aruco_marker(side_px, marker_id, dict_name):
             )
         )
 
+    marker_id = _numeric_marker_id_or_zero(marker_id)
     dictionary_id = getattr(cv2.aruco, dict_name)
     dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
 
@@ -267,6 +312,15 @@ def _get_aruco_marker(side_px, marker_id, dict_name):
     return marker
 
 
+def _crop_to_dark_pixels(marker):
+    gray = marker.convert("L")
+    dark_mask = gray.point(lambda px: 255 if px < 245 else 0)
+    bbox = dark_mask.getbbox()
+    if bbox is None:
+        return gray
+    return gray.crop(bbox)
+
+
 def _get_datamatrix_marker(Image, side_px, marker_value):
     dmtx_encode = _maybe_import_datamatrix_encode()
     if dmtx_encode is None:
@@ -278,7 +332,7 @@ def _get_datamatrix_marker(Image, side_px, marker_value):
     payload = str(marker_value).encode("utf-8")
     encoded = dmtx_encode(payload)
     marker = Image.frombytes("RGB", (encoded.width, encoded.height), encoded.pixels)
-    marker = marker.convert("L")
+    marker = _crop_to_dark_pixels(marker)
     marker = marker.resize((int(side_px), int(side_px)), resample=Image.Resampling.NEAREST)
     return marker
 
@@ -315,6 +369,7 @@ def _draw_side_line(
     label_h,
     side_line_text,
     dpi,
+    right_x=None,
 ):
     text = str(side_line_text).strip()
     if not text:
@@ -326,38 +381,31 @@ def _draw_side_line(
 
     box_w = max(1, min(box_w, label_w))
     box_h = max(1, min(box_h, label_h))
-    side_x = x0 + label_w - right_offset - box_w
+    if right_x is None:
+        side_x = x0 + label_w - right_offset - box_w
+    else:
+        side_x = int(round(right_x)) - box_w
     side_x = max(x0, min(x0 + label_w - box_w, side_x))
     side_y = y0 + int(round((label_h - box_h) / 2.0))
 
-    # Draw black box.
-    side_box = Image.new("L", (box_w, box_h), color=0)
+    side_box = Image.new("L", (box_w, box_h), color=255)
 
-    # Render white bold text rotated so it reads along the long side of the box.
-    text_canvas = Image.new("L", (box_h, box_w), color=0)
+    # Render black text rotated so it reads along the long side of the box.
+    text_canvas = Image.new("L", (box_h, box_w), color=255)
     text_draw = ImageDraw.Draw(text_canvas)
-    pad = 2
-    max_font_size = max(6, box_w)
-    chosen_font = _load_bold_font(ImageFont, max_font_size)
-    for size in range(max_font_size, 0, -1):
-        trial_font = _load_bold_font(ImageFont, size)
-        left, top, right, bottom = _get_text_bbox(trial_font, text)
-        tw = right - left
-        th = bottom - top
-        if tw <= (box_h - (2 * pad)) and th <= (box_w - (2 * pad)):
-            chosen_font = trial_font
-            break
+    font_px = max(1, int(round((FONT_POINT_SIZE / 72.0) * dpi)))
+    chosen_font = _load_font(ImageFont, font_px)
 
     left, top, right, bottom = _get_text_bbox(chosen_font, text)
     tw = right - left
     th = bottom - top
     tx = int(round((box_h - tw) / 2.0 - left))
     ty = int(round((box_w - th) / 2.0 - top))
-    text_draw.text((tx, ty), text, fill=255, font=chosen_font)
+    text_draw.text((tx, ty), text, fill=0, font=chosen_font)
 
     # Keep output orientation aligned with GUI preview direction.
     rotated = text_canvas.rotate(90, expand=True)
-    side_box.paste(rotated, (0, 0), rotated)
+    side_box.paste(rotated, (0, 0))
     page.paste(side_box, (side_x, side_y))
 
     return {
@@ -368,8 +416,67 @@ def _draw_side_line(
     }
 
 
+def _draw_right_datamatrix(
+    Image, page, x0, y0, label_w, label_h, marker_payload, dpi, marker_cache
+):
+    marker_side = _to_px(ARUCO_MARKER_SIZE_IN, dpi)
+    marker_side = max(1, min(marker_side, label_h))
+    marker_x = x0 + label_w - _to_px(ARUCO_LEFT_OFFSET_IN, dpi) - marker_side
+    marker_x = max(x0, min(x0 + label_w - marker_side, marker_x))
+    marker_y = y0 + int(round((label_h - marker_side) / 2.0))
+    marker_pil = _get_cached_marker_pil(
+        Image,
+        marker_cache,
+        MARKER_TYPE_DATAMATRIX,
+        marker_side,
+        marker_payload,
+        DEFAULT_ARUCO_DICT,
+    )
+    page.paste(marker_pil, (marker_x, marker_y))
+    return {
+        "x": marker_x,
+        "y": marker_y,
+        "w": marker_side,
+        "h": marker_side,
+    }
+
+
+def _get_cached_marker_pil(
+    Image, marker_cache, marker_type, marker_side, marker_value, marker_dict
+):
+    key = (marker_type, int(marker_side), str(marker_value), str(marker_dict))
+    cached = marker_cache.get(key)
+    if cached is not None:
+        return cached
+
+    if marker_type == MARKER_TYPE_ARUCO:
+        marker_img = _get_aruco_marker(marker_side, marker_value, marker_dict)
+        marker_pil = Image.fromarray(marker_img).convert("L")
+    elif marker_type == MARKER_TYPE_DATAMATRIX:
+        marker_pil = _get_datamatrix_marker(Image, marker_side, marker_value)
+    elif marker_type == MARKER_TYPE_QR:
+        marker_pil = _get_qr_marker(Image, marker_side, marker_value)
+    else:
+        marker_pil = None
+
+    if marker_pil is not None:
+        marker_cache[key] = marker_pil
+    return marker_pil
+
+
 def _draw_label(
-    draw, Image, ImageDraw, ImageFont, page, x0, y0, label_w, label_h, label_spec, dpi
+    draw,
+    Image,
+    ImageDraw,
+    ImageFont,
+    page,
+    x0,
+    y0,
+    label_w,
+    label_h,
+    label_spec,
+    dpi,
+    marker_cache,
 ):
     horizontal_pad = max(8, int(round(0.02 * dpi)))  # ~0.02"
     marker_text_gap = _to_px(ARUCO_RIGHT_GAP_IN, dpi)
@@ -378,6 +485,7 @@ def _draw_label(
     lines = label_spec["lines"]
     marker_type = label_spec["marker_type"]
     marker_id = label_spec["marker_id"]
+    marker_payload = label_spec.get("marker_payload", marker_id)
     marker_dict = label_spec["marker_dict"]
     side_line_text = label_spec.get("side_line", "")
 
@@ -385,6 +493,18 @@ def _draw_label(
     text_y0 = y0 + text_vertical_pad
     text_y1 = y0 + label_h - text_vertical_pad
     text_x1 = x0 + label_w - horizontal_pad
+
+    right_datamatrix = _draw_right_datamatrix(
+        Image=Image,
+        page=page,
+        x0=x0,
+        y0=y0,
+        label_w=label_w,
+        label_h=label_h,
+        marker_payload=marker_payload,
+        dpi=dpi,
+        marker_cache=marker_cache,
+    )
 
     side_box = _draw_side_line(
         Image=Image,
@@ -397,22 +517,27 @@ def _draw_label(
         label_h=label_h,
         side_line_text=side_line_text,
         dpi=dpi,
+        right_x=right_datamatrix["x"],
     )
     if side_box is not None:
         text_x1 = min(text_x1, side_box["x"] - _to_px(SIDE_LINE_TEXT_GAP_IN, dpi))
+    else:
+        text_x1 = min(
+            text_x1,
+            right_datamatrix["x"] - _to_px(ARUCO_RIGHT_GAP_IN, dpi),
+        )
 
     if marker_type != MARKER_TYPE_NONE:
         marker_side = _to_px(ARUCO_MARKER_SIZE_IN, dpi)
         marker_side = max(1, min(marker_side, label_h))
-        if marker_type == MARKER_TYPE_ARUCO:
-            marker_img = _get_aruco_marker(marker_side, marker_id, marker_dict)
-            marker_pil = Image.fromarray(marker_img).convert("L")
-        elif marker_type == MARKER_TYPE_DATAMATRIX:
-            marker_pil = _get_datamatrix_marker(Image, marker_side, marker_id)
-        elif marker_type == MARKER_TYPE_QR:
-            marker_pil = _get_qr_marker(Image, marker_side, marker_id)
-        else:
-            marker_pil = None
+        marker_pil = _get_cached_marker_pil(
+            Image,
+            marker_cache,
+            marker_type,
+            marker_side,
+            marker_id,
+            marker_dict,
+        )
         marker_x = x0 + _to_px(ARUCO_LEFT_OFFSET_IN, dpi)
         marker_y = y0 + int(round((label_h - marker_side) / 2.0))
         if marker_pil is not None:
@@ -451,6 +576,7 @@ def generate_avery_5267_sheet(
     missing=0,
     count=None,
     dpi=DEFAULT_DPI,
+    save_pdf=True,
 ):
     """
     Generate one 8.5x11 Avery 5267 label sheet at high resolution.
@@ -460,16 +586,18 @@ def generate_avery_5267_sheet(
             Expected keys:
               - lines: list[str] or str
               - marker_type: "none" | "aruco" | "datamatrix" | "qr"
-              - marker_id: int
+              - marker_id: int for ArUco, or string/int payload for DataMatrix/QR
+              - marker_payload: string/int ID for the right-side DataMatrix (optional)
               - marker_dict: str (ArUco dictionary, e.g. DICT_6X6_250)
-              - side_line: str (optional text inside right-side black strip)
+              - side_line: str (optional black text inside right-side white strip)
         output_stem: path without extension (or with extension; extension is removed)
         missing: number of labels already used on the sheet (0..79), filled row-major
         count: number of labels to print from remaining slots (default: all remaining)
         dpi: raster output DPI (default: 1200)
+        save_pdf: also save a PDF next to the PNG (default: True)
 
     Returns:
-        dict with generated file paths: {"png": "...", "pdf": "..."}
+        dict with generated file paths: {"png": "...", "pdf": "... or None"}
     """
     if missing < 0 or missing >= MAX_LABELS:
         raise ValueError("missing must be between 0 and {0}".format(MAX_LABELS - 1))
@@ -490,6 +618,7 @@ def generate_avery_5267_sheet(
 
     page = Image.new("L", (page_w, page_h), color=255)
     draw = ImageDraw.Draw(page)
+    marker_cache = {}
 
     for seq_index in range(count):
         slot_index = missing + seq_index
@@ -501,7 +630,18 @@ def generate_avery_5267_sheet(
 
         label_spec = _normalize_label_spec(label_spec_fn(seq_index, slot_index))
         _draw_label(
-            draw, Image, ImageDraw, ImageFont, page, x0, y0, label_w, label_h, label_spec, dpi
+            draw,
+            Image,
+            ImageDraw,
+            ImageFont,
+            page,
+            x0,
+            y0,
+            label_w,
+            label_h,
+            label_spec,
+            dpi,
+            marker_cache,
         )
 
     output_root = os.path.splitext(output_stem)[0]
@@ -509,8 +649,11 @@ def generate_avery_5267_sheet(
     pdf_path = output_root + ".pdf"
 
     page.save(png_path, dpi=(dpi, dpi))
-    # For PDF, keep page dimensions aligned to the same physical size at target DPI.
-    page.save(pdf_path, "PDF", resolution=dpi)
+    if save_pdf:
+        # For PDF, keep page dimensions aligned to the same physical size at target DPI.
+        page.save(pdf_path, "PDF", resolution=dpi)
+    else:
+        pdf_path = None
 
     return {"png": png_path, "pdf": pdf_path}
 
@@ -546,13 +689,12 @@ def _parse_args(argv):
         "--marker-type",
         default=MARKER_TYPE_NONE,
         choices=MARKER_TYPES,
-        help="Marker type: none, aruco, or datamatrix (default: none).",
+        help="Marker type: none, aruco, datamatrix, or qr (default: none).",
     )
     parser.add_argument(
         "--id",
-        type=int,
-        default=0,
-        help="Marker ID/value (default: 0).",
+        default="0",
+        help="Marker ID/value or DataMatrix/QR payload (default: 0).",
     )
     parser.add_argument(
         "--has-aruco",
@@ -579,7 +721,7 @@ def _parse_args(argv):
     parser.add_argument(
         "--side-line",
         default="",
-        help="Optional side-strip text (white, bold) for the right-side 8mm x 2mm box.",
+        help="Optional side-strip text (black) for the right-side 8mm x 2mm box.",
     )
     return parser.parse_args(argv)
 
@@ -601,10 +743,155 @@ def _make_static_label_fn(lines, marker_type, marker_id, marker_dict, side_line=
     return _label_fn
 
 
+def _normalize_hex_color(value, fallback="#000000"):
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        text = fallback
+    if text.startswith("#"):
+        text = text[1:]
+    if len(text) == 3:
+        text = "".join(ch * 2 for ch in text)
+    if len(text) != 6:
+        text = str(fallback).strip().lstrip("#")
+    try:
+        int(text, 16)
+    except ValueError:
+        text = str(fallback).strip().lstrip("#")
+    return "#{0}".format(text.upper())
+
+
+def _hex_to_rgb(value):
+    text = _normalize_hex_color(value).lstrip("#")
+    return tuple(int(text[i : i + 2], 16) for i in (0, 2, 4))
+
+
+def _normalize_alignment(value):
+    text = str(value).strip().lower() if value is not None else "center"
+    if text in ("left", "center", "right"):
+        return text
+    return "center"
+
+
+def _normalize_text_style(style):
+    style = style if isinstance(style, dict) else {}
+    font_size_pt = style.get("font_size_pt", 14)
+    try:
+        font_size_pt = float(font_size_pt)
+    except (TypeError, ValueError):
+        font_size_pt = 14.0
+    font_size_pt = max(2.0, min(72.0, font_size_pt))
+    return {
+        "font_size_pt": font_size_pt,
+        "text_color": _normalize_hex_color(style.get("text_color", "#000000")),
+        "align": _normalize_alignment(style.get("align", "center")),
+        "bold": bool(style.get("bold", False)),
+        "italic": bool(style.get("italic", False)),
+    }
+
+
+def _draw_text_label(ImageDraw, ImageFont, page, x0, y0, label_w, label_h, lines, style, dpi):
+    clean_lines = []
+    if isinstance(lines, str):
+        lines = [lines]
+    for line in list(lines or [])[:MAX_TEXT_LINES]:
+        text = str(line).strip()
+        if text:
+            clean_lines.append(text)
+    if not clean_lines:
+        return
+
+    pad_x = max(2, int(round(0.035 * dpi)))
+    pad_y = max(2, int(round(0.035 * dpi)))
+    box_x = x0 + pad_x
+    box_y = y0 + pad_y
+    box_w = max(1, label_w - (2 * pad_x))
+    box_h = max(1, label_h - (2 * pad_y))
+
+    font_px = max(1, int(round((float(style["font_size_pt"]) / 72.0) * dpi)))
+    font = _load_styled_font(
+        ImageFont,
+        font_px,
+        bold=bool(style.get("bold", False)),
+        italic=bool(style.get("italic", False)),
+    )
+    fill = _hex_to_rgb(style.get("text_color", "#000000"))
+    draw = ImageDraw.Draw(page)
+    line_bboxes = [_get_text_bbox(font, line) for line in clean_lines]
+    line_heights = [bottom - top for _left, top, _right, bottom in line_bboxes]
+    line_spacing = max(0, int(round(font_px * 0.18))) if len(clean_lines) > 1 else 0
+    total_h = sum(line_heights) + (line_spacing * (len(clean_lines) - 1))
+    current_y = box_y + max(0, int(round((box_h - total_h) / 2.0)))
+
+    for line, bbox in zip(clean_lines, line_bboxes):
+        left, top, right, bottom = bbox
+        text_w = right - left
+        text_h = bottom - top
+        if style["align"] == "left":
+            text_x = box_x - left
+        elif style["align"] == "right":
+            text_x = box_x + box_w - text_w - left
+        else:
+            text_x = box_x + int(round((box_w - text_w) / 2.0)) - left
+        text_y = current_y - top
+        draw.text((int(round(text_x)), int(round(text_y))), line, fill=fill, font=font)
+        current_y += text_h + line_spacing
+
+
+def generate_avery_5267_text_sheet(
+    label_text_fn,
+    output_stem,
+    missing=0,
+    count=None,
+    dpi=DEFAULT_DPI,
+    style=None,
+    save_pdf=True,
+):
+    if missing < 0 or missing >= MAX_LABELS:
+        raise ValueError("missing must be between 0 and {0}".format(MAX_LABELS - 1))
+
+    remaining = MAX_LABELS - missing
+    if count is None:
+        count = remaining
+    if count < 0:
+        raise ValueError("count must be >= 0")
+    count = min(count, remaining)
+
+    Image, ImageDraw, ImageFont = _require_pillow()
+    style = _normalize_text_style(style)
+
+    page_w = _to_px(PAGE_WIDTH_IN, dpi)
+    page_h = _to_px(PAGE_HEIGHT_IN, dpi)
+    label_w = _to_px(LABEL_WIDTH_IN, dpi)
+    label_h = _to_px(LABEL_HEIGHT_IN, dpi)
+
+    page = Image.new("RGB", (page_w, page_h), color=(255, 255, 255))
+
+    for seq_index in range(count):
+        slot_index = missing + seq_index
+        row = slot_index // COLS
+        col = slot_index % COLS
+
+        x0 = _to_px(LEFT_MARGIN_IN + (col * H_PITCH_IN), dpi)
+        y0 = _to_px(TOP_MARGIN_IN + (row * V_PITCH_IN), dpi)
+
+        lines = label_text_fn(seq_index, slot_index)
+        _draw_text_label(ImageDraw, ImageFont, page, x0, y0, label_w, label_h, lines, style, dpi)
+
+    output_root = os.path.splitext(output_stem)[0]
+    png_path = output_root + ".png"
+    pdf_path = output_root + ".pdf"
+    page.save(png_path, dpi=(dpi, dpi))
+    if save_pdf:
+        page.save(pdf_path, "PDF", resolution=dpi)
+    else:
+        pdf_path = None
+    return {"png": png_path, "pdf": pdf_path}
+
+
 def main(argv=None):
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     marker_type = _normalize_marker_type(args.marker_type)
-    marker_id = int(args.id)
+    marker_id = args.id
     if args.has_aruco:
         marker_type = MARKER_TYPE_ARUCO
         marker_id = int(args.aruco_id)

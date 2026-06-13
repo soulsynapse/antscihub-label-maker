@@ -4,6 +4,7 @@ __pycache__/
 
 # Local app/session artifacts
 .avery_5267_gui.ini
+.avery_5267_print_debug.log
 label_session.json
 
 # Generated label outputs
