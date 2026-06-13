@@ -23,6 +23,7 @@ from PyQt6.QtGui import (
     QAction,
     QColor,
     QFont,
+    QFontMetrics,
     QImage,
     QImageReader,
     QPageLayout,
@@ -702,6 +703,86 @@ class TextLabelPreviewWidget(SheetPreviewWidget):
             horizontal = Qt.AlignmentFlag.AlignHCenter
         return int(horizontal | Qt.AlignmentFlag.AlignVCenter)
 
+    def _text_from_spec(self, spec):
+        if not isinstance(spec, dict):
+            return str(spec).strip()
+        if "text" in spec:
+            return str(spec.get("text", "")).strip()
+        raw_lines = spec.get("lines", [])
+        if isinstance(raw_lines, str):
+            return raw_lines.strip()
+        if raw_lines is None:
+            return ""
+        return "\n".join(str(line).strip() for line in raw_lines if str(line).strip())
+
+    def _break_long_word(self, metrics, word, max_width):
+        parts = []
+        current = ""
+        for char in word:
+            trial = current + char
+            if current and metrics.horizontalAdvance(trial) > max_width:
+                parts.append(current)
+                current = char
+            else:
+                current = trial
+        if current:
+            parts.append(current)
+        return parts or [word]
+
+    def _wrap_text(self, metrics, text, max_width):
+        wrapped = []
+        for paragraph in (text.splitlines() or [text]):
+            words = paragraph.split()
+            if not words:
+                wrapped.append("")
+                continue
+
+            current = ""
+            for word in words:
+                word_parts = (
+                    self._break_long_word(metrics, word, max_width)
+                    if metrics.horizontalAdvance(word) > max_width
+                    else [word]
+                )
+                for part in word_parts:
+                    trial = part if not current else "{0} {1}".format(current, part)
+                    if not current or metrics.horizontalAdvance(trial) <= max_width:
+                        current = trial
+                    else:
+                        wrapped.append(current)
+                        current = part
+            if current:
+                wrapped.append(current)
+        return wrapped
+
+    def _fit_text_layout(self, text, max_width, max_height, max_font_px):
+        base_font = QFont("Arial")
+        base_font.setBold(_safe_bool(self.text_style.get("bold", False)))
+        base_font.setItalic(_safe_bool(self.text_style.get("italic", False)))
+        max_width = max(1, int(round(max_width)))
+        max_height = max(1, int(round(max_height)))
+
+        for font_px in range(max(1, int(max_font_px)), 0, -1):
+            font = QFont(base_font)
+            font.setPixelSize(font_px)
+            metrics = QFontMetrics(font)
+            lines = self._wrap_text(metrics, text, max_width)
+            if not lines:
+                return font, [], 0, 0
+            line_h = max(1, metrics.height())
+            spacing = max(0, int(round(font_px * 0.18))) if len(lines) > 1 else 0
+            total_h = (len(lines) * line_h) + ((len(lines) - 1) * spacing)
+            max_line_w = max((metrics.horizontalAdvance(line) for line in lines), default=0)
+            if total_h <= max_height and max_line_w <= max_width:
+                return font, lines, spacing, total_h
+
+        font = QFont(base_font)
+        font.setPixelSize(1)
+        metrics = QFontMetrics(font)
+        lines = self._wrap_text(metrics, text, max_width)
+        total_h = len(lines) * max(1, metrics.height())
+        return font, lines, 0, total_h
+
     def paintEvent(self, event):  # pylint: disable=unused-argument
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -728,16 +809,7 @@ class TextLabelPreviewWidget(SheetPreviewWidget):
             painter.drawLine(r.topRight(), r.bottomLeft())
 
         font_size_pt = _safe_float(self.text_style.get("font_size_pt", 14), 14)
-        font_px = max(1, int(round((font_size_pt / 72.0) * px_per_in)))
-        font = QFont("Arial")
-        font.setBold(_safe_bool(self.text_style.get("bold", False)))
-        font.setItalic(_safe_bool(self.text_style.get("italic", False)))
-        font.setPixelSize(font_px)
-        painter.setFont(font)
-        painter.setPen(QPen(QColor(str(self.text_style.get("text_color", "#000000"))), 1))
-        metrics = painter.fontMetrics()
-        line_h = max(1, metrics.height())
-        line_spacing = max(0, int(round(font_px * 0.18)))
+        max_font_px = max(1, int(round((font_size_pt / 72.0) * px_per_in)))
         alignment = self._alignment_flags()
 
         for seq_index, spec in enumerate(self.row_specs):
@@ -749,11 +821,8 @@ class TextLabelPreviewWidget(SheetPreviewWidget):
             painter.drawRect(r)
             painter.setPen(QPen(QColor(str(self.text_style.get("text_color", "#000000"))), 1))
 
-            raw_lines = spec.get("lines", [])
-            if isinstance(raw_lines, str):
-                raw_lines = [raw_lines]
-            lines = [str(line).strip() for line in raw_lines[:MAX_TEXT_LINES] if str(line).strip()]
-            if not lines:
+            text = self._text_from_spec(spec)
+            if not text:
                 continue
 
             pad_x = max(1.0, 0.035 * px_per_in)
@@ -762,7 +831,13 @@ class TextLabelPreviewWidget(SheetPreviewWidget):
             text_y = r.y() + pad_y
             text_w = max(1.0, r.width() - (2.0 * pad_x))
             text_h = max(1.0, r.height() - (2.0 * pad_y))
-            total_h = (len(lines) * line_h) + ((len(lines) - 1) * line_spacing)
+            font, lines, line_spacing, total_h = self._fit_text_layout(
+                text, text_w, text_h, max_font_px
+            )
+            if not lines:
+                continue
+            painter.setFont(font)
+            line_h = max(1, painter.fontMetrics().height())
             current_y = text_y + max(0.0, (text_h - total_h) / 2.0)
 
             for line in lines:
@@ -793,22 +868,12 @@ class Avery5267Window(QMainWindow):
     COL_LINE5 = 7
     COL_SIDE_LINE = 8
     TEXT_COL_SLOT = 0
-    TEXT_COL_LINE1 = 1
-    TEXT_COL_LINE2 = 2
-    TEXT_COL_LINE3 = 3
-    TEXT_COL_LINE4 = 4
-    TEXT_COL_LINE5 = 5
+    TEXT_COL_TEXT = 1
     # Backward-compatible aliases used in older code paths/saved sessions.
     COL_USE_ARUCO = COL_USE_MARKER
     COL_ARUCO_ID = COL_MARKER_ID
     LINE_COLS = (COL_LINE1, COL_LINE2, COL_LINE3, COL_LINE4, COL_LINE5)
-    TEXT_LINE_COLS = (
-        TEXT_COL_LINE1,
-        TEXT_COL_LINE2,
-        TEXT_COL_LINE3,
-        TEXT_COL_LINE4,
-        TEXT_COL_LINE5,
-    )
+    TEXT_LINE_COLS = (TEXT_COL_TEXT,)
     SETTINGS_FILENAME = ".avery_5267_gui.ini"
     PRINT_DEBUG_FILENAME = ".avery_5267_print_debug.log"
 
@@ -882,9 +947,9 @@ class Avery5267Window(QMainWindow):
         self._load_session_state()
         self._load_text_label_state()
         self._on_missing_changed(self.missing_spin.value())
-        self._on_text_missing_changed(self.text_missing_spin.value())
         self.refresh_preview()
         self.refresh_text_preview()
+        self.tabs.setCurrentWidget(self.editor_tab)
 
     def _print_debug_path(self):
         return os.path.join(os.path.dirname(SCRIPT_DIR), self.PRINT_DEBUG_FILENAME)
@@ -1155,7 +1220,7 @@ class Avery5267Window(QMainWindow):
         self.text_font_size_spin = QSpinBox()
         self.text_font_size_spin.setRange(2, 72)
         self.text_font_size_spin.setValue(14)
-        form.addRow("Font Size", self.text_font_size_spin)
+        form.addRow("Max Font Size", self.text_font_size_spin)
 
         self.text_color_btn = QPushButton("#000000")
         self._set_text_color("#000000")
@@ -1195,14 +1260,11 @@ class Avery5267Window(QMainWindow):
         right_layout.addWidget(QLabel("Text Entry Table (one row per label)"))
 
         self.text_table = QTableWidget()
-        self.text_table.setColumnCount(6)
-        self.text_table.setHorizontalHeaderLabels(
-            ["Slot", "Text 1", "Text 2", "Text 3", "Text 4", "Text 5"]
-        )
+        self.text_table.setColumnCount(2)
+        self.text_table.setHorizontalHeaderLabels(["Slot", "Text"])
         header = self.text_table.horizontalHeader()
         header.setSectionResizeMode(self.TEXT_COL_SLOT, QHeaderView.ResizeMode.ResizeToContents)
-        for col in self.TEXT_LINE_COLS:
-            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.TEXT_COL_TEXT, QHeaderView.ResizeMode.Stretch)
         self.text_table.verticalHeader().setVisible(False)
         self.text_table.setAlternatingRowColors(True)
         self.text_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -1741,12 +1803,26 @@ class Avery5267Window(QMainWindow):
         self.refresh_text_preview()
 
     def _on_text_missing_changed(self, value):
+        value = int(value)
+        if self.missing_spin.value() != value:
+            self.missing_spin.blockSignals(True)
+            try:
+                self.missing_spin.setValue(value)
+            finally:
+                self.missing_spin.blockSignals(False)
+
         max_count = MAX_LABELS - int(value)
         self.text_count_spin.setMaximum(max_count)
         if self.text_count_spin.value() > max_count:
             self.text_count_spin.setValue(max_count)
         self._sync_text_table_rows()
         self.refresh_text_preview()
+
+        self.count_spin.setMaximum(max_count)
+        if self.count_spin.value() > max_count:
+            self.count_spin.setValue(max_count)
+        self._sync_table_rows()
+        self.refresh_preview()
 
     def _on_text_count_changed(self, value):  # pylint: disable=unused-argument
         self._sync_text_table_rows()
@@ -1777,13 +1853,7 @@ class Avery5267Window(QMainWindow):
     def _collect_text_row_specs(self):
         specs = []
         for row in range(self.text_table.rowCount()):
-            specs.append(
-                {
-                    "lines": [
-                        self._get_text_item_text(row, col) for col in self.TEXT_LINE_COLS
-                    ],
-                }
-            )
+            specs.append({"text": self._get_text_item_text(row, self.TEXT_COL_TEXT)})
         return specs
 
     def refresh_text_preview(self):
@@ -1813,16 +1883,22 @@ class Avery5267Window(QMainWindow):
         return []
 
     def _get_text_row_payload(self, row):
-        return {"lines": [self._get_text_item_text(row, col) for col in self.TEXT_LINE_COLS]}
+        return {"text": self._get_text_item_text(row, self.TEXT_COL_TEXT)}
 
     def _apply_text_row_payload(self, row, payload):
-        lines = payload.get("lines", [])
-        if isinstance(lines, str):
-            lines = [lines]
-        for i, col in enumerate(self.TEXT_LINE_COLS):
-            item = self.text_table.item(row, col)
-            if item is not None:
-                item.setText(str(lines[i]) if i < len(lines) else "")
+        if not isinstance(payload, dict):
+            text = str(payload)
+        elif "text" in payload:
+            text = str(payload.get("text", ""))
+        else:
+            lines = payload.get("lines", [])
+            if isinstance(lines, str):
+                text = lines
+            else:
+                text = "\n".join(str(line).strip() for line in lines if str(line).strip())
+        item = self.text_table.item(row, self.TEXT_COL_TEXT)
+        if item is not None:
+            item.setText(text)
 
     def copy_selected_text_row(self):
         self._sync_text_table_rows()
@@ -2108,7 +2184,7 @@ class Avery5267Window(QMainWindow):
         self._sync_text_table_rows()
         return {
             "version": 1,
-            "missing": self.text_missing_spin.value(),
+            "missing": self.missing_spin.value(),
             "count": self.text_count_spin.value(),
             "dpi": self.text_dpi_spin.value(),
             "output_stem": self.text_output_edit.text().strip(),
@@ -2128,7 +2204,7 @@ class Avery5267Window(QMainWindow):
 
         default_count = self.text_count_spin.value()
         default_row_count = len(rows_payload) if rows_payload else default_count
-        missing = _safe_int(payload.get("missing", self.text_missing_spin.value()), 0)
+        missing = self.missing_spin.value()
         missing = max(0, min(MAX_LABELS - 1, missing))
         count = _safe_int(payload.get("count", default_row_count), default_row_count)
         count = max(1, min(MAX_LABELS - missing, count))
@@ -2314,12 +2390,26 @@ class Avery5267Window(QMainWindow):
         return self._is_row_aruco_enabled(row)
 
     def _on_missing_changed(self, value):
+        value = int(value)
+        if self.text_missing_spin.value() != value:
+            self.text_missing_spin.blockSignals(True)
+            try:
+                self.text_missing_spin.setValue(value)
+            finally:
+                self.text_missing_spin.blockSignals(False)
+
         max_count = MAX_LABELS - int(value)
         self.count_spin.setMaximum(max_count)
         if self.count_spin.value() > max_count:
             self.count_spin.setValue(max_count)
         self._sync_table_rows()
         self.refresh_preview()
+
+        self.text_count_spin.setMaximum(max_count)
+        if self.text_count_spin.value() > max_count:
+            self.text_count_spin.setValue(max_count)
+        self._sync_text_table_rows()
+        self.refresh_text_preview()
 
     def _on_count_changed(self, value):  # pylint: disable=unused-argument
         self._sync_table_rows()
@@ -2548,7 +2638,7 @@ class Avery5267Window(QMainWindow):
 
         def label_text_fn(seq_index, slot_index):  # pylint: disable=unused-argument
             if seq_index < len(row_specs):
-                return row_specs[seq_index].get("lines", [])
+                return row_specs[seq_index].get("text", "")
             return []
 
         return generate_avery_5267_text_sheet(

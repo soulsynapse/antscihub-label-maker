@@ -789,15 +789,99 @@ def _normalize_text_style(style):
     }
 
 
-def _draw_text_label(ImageDraw, ImageFont, page, x0, y0, label_w, label_h, lines, style, dpi):
-    clean_lines = []
-    if isinstance(lines, str):
-        lines = [lines]
-    for line in list(lines or [])[:MAX_TEXT_LINES]:
-        text = str(line).strip()
-        if text:
-            clean_lines.append(text)
-    if not clean_lines:
+def _text_label_text(value):
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        if "text" in value:
+            return str(value.get("text", "")).strip()
+        value = value.get("lines", [])
+    if value is None:
+        return ""
+    if not isinstance(value, (list, tuple)):
+        return str(value).strip()
+    lines = [str(line).strip() for line in value if str(line).strip()]
+    return "\n".join(lines)
+
+
+def _break_long_word(font, word, max_width):
+    parts = []
+    current = ""
+    for char in word:
+        trial = current + char
+        if current and _get_text_size(font, trial)[0] > max_width:
+            parts.append(current)
+            current = char
+        else:
+            current = trial
+    if current:
+        parts.append(current)
+    return parts or [word]
+
+
+def _wrap_text_for_font(font, text, max_width):
+    wrapped = []
+    paragraphs = text.splitlines() or [text]
+    for paragraph in paragraphs:
+        words = paragraph.split()
+        if not words:
+            wrapped.append("")
+            continue
+
+        current = ""
+        for word in words:
+            word_parts = (
+                _break_long_word(font, word, max_width)
+                if _get_text_size(font, word)[0] > max_width
+                else [word]
+            )
+            for part in word_parts:
+                trial = part if not current else "{0} {1}".format(current, part)
+                if not current or _get_text_size(font, trial)[0] <= max_width:
+                    current = trial
+                else:
+                    wrapped.append(current)
+                    current = part
+        if current:
+            wrapped.append(current)
+    return wrapped
+
+
+def _fit_text_label_layout(ImageFont, text, style, box_w, box_h, dpi):
+    start_px = max(1, int(round((float(style["font_size_pt"]) / 72.0) * dpi)))
+    for font_px in range(start_px, 0, -1):
+        font = _load_styled_font(
+            ImageFont,
+            font_px,
+            bold=bool(style.get("bold", False)),
+            italic=bool(style.get("italic", False)),
+        )
+        wrapped = _wrap_text_for_font(font, text, box_w)
+        if not wrapped:
+            return font, [], 0, 0
+        bboxes = [_get_text_bbox(font, line if line else " ") for line in wrapped]
+        heights = [bottom - top for _left, top, _right, bottom in bboxes]
+        spacing = max(0, int(round(font_px * 0.18))) if len(wrapped) > 1 else 0
+        total_h = sum(heights) + (spacing * (len(wrapped) - 1))
+        max_w = max((_get_text_size(font, line)[0] for line in wrapped), default=0)
+        if total_h <= box_h and max_w <= box_w:
+            return font, wrapped, spacing, total_h
+
+    font = _load_styled_font(
+        ImageFont,
+        1,
+        bold=bool(style.get("bold", False)),
+        italic=bool(style.get("italic", False)),
+    )
+    wrapped = _wrap_text_for_font(font, text, box_w)
+    bboxes = [_get_text_bbox(font, line if line else " ") for line in wrapped]
+    total_h = sum(bottom - top for _left, top, _right, bottom in bboxes)
+    return font, wrapped, 0, total_h
+
+
+def _draw_text_label(ImageDraw, ImageFont, page, x0, y0, label_w, label_h, text, style, dpi):
+    text = _text_label_text(text)
+    if not text:
         return
 
     pad_x = max(2, int(round(0.035 * dpi)))
@@ -807,23 +891,18 @@ def _draw_text_label(ImageDraw, ImageFont, page, x0, y0, label_w, label_h, lines
     box_w = max(1, label_w - (2 * pad_x))
     box_h = max(1, label_h - (2 * pad_y))
 
-    font_px = max(1, int(round((float(style["font_size_pt"]) / 72.0) * dpi)))
-    font = _load_styled_font(
-        ImageFont,
-        font_px,
-        bold=bool(style.get("bold", False)),
-        italic=bool(style.get("italic", False)),
+    font, wrapped_lines, line_spacing, total_h = _fit_text_label_layout(
+        ImageFont, text, style, box_w, box_h, dpi
     )
+    if not wrapped_lines:
+        return
+
     fill = _hex_to_rgb(style.get("text_color", "#000000"))
     draw = ImageDraw.Draw(page)
-    line_bboxes = [_get_text_bbox(font, line) for line in clean_lines]
-    line_heights = [bottom - top for _left, top, _right, bottom in line_bboxes]
-    line_spacing = max(0, int(round(font_px * 0.18))) if len(clean_lines) > 1 else 0
-    total_h = sum(line_heights) + (line_spacing * (len(clean_lines) - 1))
     current_y = box_y + max(0, int(round((box_h - total_h) / 2.0)))
 
-    for line, bbox in zip(clean_lines, line_bboxes):
-        left, top, right, bottom = bbox
+    for line in wrapped_lines:
+        left, top, right, bottom = _get_text_bbox(font, line if line else " ")
         text_w = right - left
         text_h = bottom - top
         if style["align"] == "left":
